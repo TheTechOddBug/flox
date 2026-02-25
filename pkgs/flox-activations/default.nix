@@ -46,14 +46,14 @@ craneLib.buildPackage (
     CARGO_PROFILE = "small";
 
     # runtime dependencies
-    buildInputs = rust-external-deps.buildInputs ++ [ ];
+    buildInputs = rust-external-deps.buildInputs ++ [
+      coreutils # for `sleep infinity`
+    ];
 
     # build dependencies
     nativeBuildInputs = rust-external-deps.nativeBuildInputs;
 
-    propagatedBuildInputs = rust-external-deps.propagatedBuildInputs ++ [
-      coreutils # for `sleep infinity`
-    ];
+    propagatedBuildInputs = rust-external-deps.propagatedBuildInputs ++ [ ];
 
     # https://github.com/ipetkov/crane/issues/385
     # doNotLinkInheritedArtifacts = true;
