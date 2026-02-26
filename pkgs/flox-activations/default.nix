@@ -2,7 +2,6 @@
   bash,
   cacert,
   glibcLocalesUtf8,
-  hostPlatform,
   inputs,
   lib,
   pkgsFor,
@@ -11,6 +10,7 @@
   flox-src,
   rust-external-deps,
   coreutils,
+  stdenv,
 }:
 let
   # crane (<https://crane.dev/>) library for building rust packages
@@ -96,7 +96,7 @@ craneLib.buildPackage (
     };
   }
   // envs
-  // lib.optionalAttrs hostPlatform.isLinux {
+  // lib.optionalAttrs stdenv.hostPlatform.isLinux {
     LOCALE_ARCHIVE = "${glibcLocalesUtf8}/lib/locale/locale-archive";
   }
 )
