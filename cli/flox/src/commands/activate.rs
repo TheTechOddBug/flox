@@ -8,8 +8,15 @@ use std::{env, fs};
 use anyhow::{Context, Result, anyhow, bail};
 use bpaf::Bpaf;
 use crossterm::tty::IsTty;
-use flox_core::activate::context::{ActivateCtx, ActivateMode, AttachCtx, InvocationType};
+use flox_core::activate::context::{
+    ActivateCtx,
+    ActivateMode,
+    AttachCtx,
+    AttachProjectCtx,
+    InvocationType,
+};
 use flox_core::activate::vars::{FLOX_ACTIVATIONS_BIN, FLOX_ACTIVATIONS_VERBOSITY_VAR};
+use flox_core::activations::activation_state_dir_path;
 use flox_core::traceable_path;
 use flox_rust_sdk::data::System;
 use flox_rust_sdk::flox::{DEFAULT_NAME, Flox};
@@ -42,6 +49,8 @@ use crate::commands::check_for_upgrades::spawn_detached_check_for_upgrades_proce
 use crate::commands::services::ServicesCommandsError;
 use crate::commands::{
     EnvironmentSelectError,
+    SHELL_COMPLETION_COMMAND,
+    SHELL_COMPLETION_FILE,
     ensure_environment_trust,
     render_composition_manifest,
     uninitialized_environment_description,
@@ -49,6 +58,7 @@ use crate::commands::{
 use crate::config::{Config, EnvironmentPromptConfig};
 use crate::utils::errors::format_diverged_metadata;
 use crate::utils::message;
+use crate::utils::metrics::read_metrics_uuid;
 use crate::utils::openers::CliShellExt;
 use crate::{Exit, environment_subcommand_metric, subcommand_metric, utils};
 
@@ -62,13 +72,20 @@ pub static INTERACTIVE_BASH_BIN: LazyLock<PathBuf> = LazyLock::new(|| {
 pub enum CommandSelect {
     ShellCommand {
         /// Shell command string to run in a subshell started in the activated environment
-        #[bpaf(long("command"), short('c'))]
+        #[bpaf(
+            long("command"),
+            short('c'),
+            argument("cmd"),
+            complete_shell(SHELL_COMPLETION_COMMAND)
+        )]
         shell_command: String,
     },
     ExecCommand {
         /// Command to exec in the activated environment. This does not run any profile scripts
-        #[bpaf(positional("cmd"), strict, some("must provide a non-empty command"))]
-        exec_command: Vec<String>,
+        #[bpaf(positional("cmd"), strict, complete_shell(SHELL_COMPLETION_COMMAND))]
+        command: String,
+        #[bpaf(positional("arg"), strict, complete_shell(SHELL_COMPLETION_FILE), many)]
+        args: Vec<String>,
     },
 }
 
@@ -149,13 +166,16 @@ impl Activate {
                     InvocationType::Interactive
                 }
             },
-            Some(CommandSelect::ExecCommand { ref exec_command }) => {
-                if exec_command.is_empty() {
-                    unreachable!("empty command provided when expected some");
-                } else if exec_command[0].is_empty() {
+            Some(CommandSelect::ExecCommand {
+                ref command,
+                ref args,
+            }) => {
+                if command.is_empty() {
                     bail!("empty command provided");
                 } else {
-                    InvocationType::ExecCommand(exec_command.clone())
+                    let mut exec_command = vec![command.clone()];
+                    exec_command.extend(args.iter().cloned());
+                    InvocationType::ExecCommand(exec_command)
                 }
             },
             Some(CommandSelect::ShellCommand { ref shell_command }) => {
@@ -323,7 +343,7 @@ impl Activate {
         let (set_prompt, hide_default_prompt) = match (
             config.flox.set_prompt,
             config.flox.hide_default_prompt,
-            config.flox.shell_prompt,
+            &config.flox.shell_prompt,
         ) {
             (None, None, Some(EnvironmentPromptConfig::ShowAll)) => (true, false),
             (None, None, Some(EnvironmentPromptConfig::HideDefault)) => (true, true),
@@ -380,39 +400,50 @@ impl Activate {
         };
         subcommand_metric!("activate", "shell" = shell.to_string());
 
-        let attach_ctx = AttachCtx {
-            dot_flox_path: concrete_environment.dot_flox_path().to_path_buf(),
+        let core = AttachCtx {
             // Don't rely on FLOX_ENV in the environment when we explicitly know
             // what it should be. This is necessary for nested activations where an
             // outer export of FLOX_ENV would be inherited by the inner activation.
             env: mode_link_path.to_string_lossy().to_string(),
-            env_project: Some(concrete_environment.project_path()?),
             env_cache: concrete_environment.cache_path()?.into_inner(),
             env_description: now_active.bare_description(),
             flox_active_environments: flox_active_environments.to_string(),
-            flox_env_log_dir: Some(concrete_environment.log_path()?.to_path_buf()),
             prompt_color_1,
             prompt_color_2,
             flox_prompt_environments,
             set_prompt,
-            // TODO: we should probably figure out a more consistent way to
-            // pass this since it's also passed for `flox build`
-            flox_runtime_dir: flox.runtime_dir.to_string_lossy().to_string(),
             flox_env_cuda_detection,
-            flox_services_socket: Some(socket_path),
-            services_to_start,
-            process_compose_bin: Some(PathBuf::from(&*PROCESS_COMPOSE_BIN)),
             interpreter_path,
         };
 
+        let dot_flox_path = concrete_environment.dot_flox_path().to_path_buf();
+
+        let project = AttachProjectCtx {
+            env_project: concrete_environment.project_path()?,
+            dot_flox_path: dot_flox_path.clone(),
+            flox_env_log_dir: concrete_environment.log_path()?.to_path_buf(),
+            flox_services_socket: socket_path,
+            process_compose_bin: PathBuf::from(&*PROCESS_COMPOSE_BIN),
+            services_to_start,
+        };
+
+        let activation_state_dir = activation_state_dir_path(&flox.runtime_dir, &dot_flox_path);
+
+        // None signals metrics disabled.
+        let metrics_uuid = (!config.flox.disable_metrics)
+            .then(|| read_metrics_uuid(&config).ok())
+            .flatten();
+
         let activate_data = ActivateCtx {
             flox_activate_store_path: store_path.to_string_lossy().to_string(),
-            attach_ctx,
+            attach_ctx: core,
+            project_ctx: Some(project),
+            activation_state_dir,
             mode,
             shell,
             invocation_type: Some(invocation_type),
-            run_monitoring_loop: true,
             remove_after_reading: true,
+            metrics_uuid,
         };
 
         let tempfile = tempfile::NamedTempFile::new_in(flox.temp_dir)?;

@@ -394,18 +394,18 @@ EOF
 
   # Test running the activate script directly in various forms.
   export _FLOX_SHELL_FORCE="bash"
-  FLOX_RUNTIME_DIR="$FLOX_CACHE_DIR" NO_COLOR=1 run $PROJECT_DIR/.flox/run/$NIX_SYSTEM.$PROJECT_NAME.run/activate -c :
+  NO_COLOR=1 run $PROJECT_DIR/.flox/run/$NIX_SYSTEM.$PROJECT_NAME.run/activate --env $PROJECT_DIR/.flox/run/$NIX_SYSTEM.$PROJECT_NAME.run -c :
   assert_success
   assert_output --partial "sourcing hook.on-activate"
-  FLOX_RUNTIME_DIR="$FLOX_CACHE_DIR" NO_COLOR=1 run $PROJECT_DIR/.flox/run/$NIX_SYSTEM.$PROJECT_NAME.dev/activate --command :
+  NO_COLOR=1 run $PROJECT_DIR/.flox/run/$NIX_SYSTEM.$PROJECT_NAME.dev/activate --env $PROJECT_DIR/.flox/run/$NIX_SYSTEM.$PROJECT_NAME.dev -c :
   assert_success
-  FLOX_RUNTIME_DIR="$FLOX_CACHE_DIR" NO_COLOR=1 run $PROJECT_DIR/.flox/run/$NIX_SYSTEM.$PROJECT_NAME.dev/activate -c true
+  NO_COLOR=1 run $PROJECT_DIR/.flox/run/$NIX_SYSTEM.$PROJECT_NAME.dev/activate --env $PROJECT_DIR/.flox/run/$NIX_SYSTEM.$PROJECT_NAME.dev -c true
   assert_success
-  FLOX_RUNTIME_DIR="$FLOX_CACHE_DIR" NO_COLOR=1 run $PROJECT_DIR/.flox/run/$NIX_SYSTEM.$PROJECT_NAME.dev/activate --command true
+  NO_COLOR=1 run $PROJECT_DIR/.flox/run/$NIX_SYSTEM.$PROJECT_NAME.dev/activate --env $PROJECT_DIR/.flox/run/$NIX_SYSTEM.$PROJECT_NAME.dev --command true
   assert_success
-  FLOX_RUNTIME_DIR="$FLOX_CACHE_DIR" NO_COLOR=1 run $PROJECT_DIR/.flox/run/$NIX_SYSTEM.$PROJECT_NAME.dev/activate true
+  NO_COLOR=1 run $PROJECT_DIR/.flox/run/$NIX_SYSTEM.$PROJECT_NAME.dev/activate --env $PROJECT_DIR/.flox/run/$NIX_SYSTEM.$PROJECT_NAME.dev true
   assert_success
-  FLOX_RUNTIME_DIR="$FLOX_CACHE_DIR" NO_COLOR=1 run $PROJECT_DIR/.flox/run/$NIX_SYSTEM.$PROJECT_NAME.dev/activate -- true
+  NO_COLOR=1 run $PROJECT_DIR/.flox/run/$NIX_SYSTEM.$PROJECT_NAME.dev/activate --env $PROJECT_DIR/.flox/run/$NIX_SYSTEM.$PROJECT_NAME.dev -- true
   assert_success
 }
 
@@ -415,12 +415,24 @@ EOF
   _FLOX_USE_CATALOG_MOCK="$GENERATED_DATA/resolve/hello.yaml" "$FLOX_BIN" install hello
 
   # Verify that running the activate script directly can access installed packages.
-  FLOX_RUNTIME_DIR="$FLOX_CACHE_DIR" NO_COLOR=1 run $PROJECT_DIR/.flox/run/$NIX_SYSTEM.$PROJECT_NAME.dev/activate -- hello
+  NO_COLOR=1 run $PROJECT_DIR/.flox/run/$NIX_SYSTEM.$PROJECT_NAME.dev/activate --env $PROJECT_DIR/.flox/run/$NIX_SYSTEM.$PROJECT_NAME.dev -- hello
   assert_success
   assert_output --partial "Hello, world!"
-  FLOX_RUNTIME_DIR="$FLOX_CACHE_DIR" NO_COLOR=1 run $PROJECT_DIR/.flox/run/$NIX_SYSTEM.$PROJECT_NAME.dev/activate -c hello
+  NO_COLOR=1 run $PROJECT_DIR/.flox/run/$NIX_SYSTEM.$PROJECT_NAME.dev/activate --env $PROJECT_DIR/.flox/run/$NIX_SYSTEM.$PROJECT_NAME.dev --command hello
   assert_success
   assert_output --partial "Hello, world!"
+}
+
+# bats test_tags=activate:standalone
+@test "activation works with env -i (empty environment)" {
+  project_setup
+  _FLOX_USE_CATALOG_MOCK="$GENERATED_DATA/resolve/hello.yaml" "$FLOX_BIN" install hello
+
+  # Current recommendation for isolating environments:
+  # https://github.com/flox/flox/issues/2447
+  run env -i FLOX_DISABLE_METRICS=true "$FLOX_BIN" activate -d "$PROJECT_DIR" -- hello
+  assert_success
+  assert_output "Hello, world!"
 }
 
 # bats test_tags=activate,activate:hook,activate:hook:fish
@@ -3378,7 +3390,7 @@ EOF
       echo "Started outer activation.."
       echo "$$" > activation_pid
 
-      ACTIVATIONS_DIR=$(dirname "$_FLOX_START_STATE_DIR")
+      ACTIVATIONS_DIR=$("$FLOX_BIN" activation-state -d "$PROJECT_DIR")
       STATE_PATH="${ACTIVATIONS_DIR}/state.json"
 
       # Stop the executive before making changes to state.json which will
@@ -5190,15 +5202,66 @@ EOF
   assert_equal "$stderr" "$expected_stderr"
 }
 
-@test "start state directory and files are not world-readable (may contain secrets)" {
+@test "hook.on-activate exit 0 produces helpful error" {
+  project_setup
+
+  MANIFEST_CONTENTS="$(cat << "EOF"
+    version = 1
+    [hook]
+    on-activate = """
+      export TEST_VAR="captured"
+      exit 0
+    """
+EOF
+  )"
+
+  echo "$MANIFEST_CONTENTS" | "$FLOX_BIN" edit -f -
+
+  unset RUST_BACKTRACE
+  run "$FLOX_BIN" activate -c 'echo "TEST_VAR=$TEST_VAR"'
+  assert_failure
+  assert_output "✘ ERROR: The hook.on-activate script did not complete normally.
+
+Review your script for the use of:
+- 'exit' commands, which should be replaced with 'return'
+- 'exec' commands, which should be run in a subshell: '(exec command)'"
+}
+
+@test "hook.on-activate exec produces helpful error" {
+  project_setup
+
+  MANIFEST_CONTENTS="$(cat << "EOF"
+    version = 1
+    [hook]
+    on-activate = """
+      exec true
+    """
+EOF
+  )"
+
+  echo "$MANIFEST_CONTENTS" | "$FLOX_BIN" edit -f -
+
+  unset RUST_BACKTRACE
+  run "$FLOX_BIN" activate -c 'echo hello'
+  assert_failure
+  assert_output "✘ ERROR: The hook.on-activate script did not complete normally.
+
+Review your script for the use of:
+- 'exit' commands, which should be replaced with 'return'
+- 'exec' commands, which should be run in a subshell: '(exec command)'"
+}
+
+@test "activation state directory and files are not world-readable (may contain secrets)" {
   project_setup
 
   FLOX_SHELL="bash" run "$FLOX_BIN" activate -c '
-    [ -n "$_FLOX_START_STATE_DIR" ] || exit 1
-    [ -d "$_FLOX_START_STATE_DIR" ] || exit 2
+    ACTIVATIONS_DIR=$("$FLOX_BIN" activation-state -d "$FLOX_ENV_PROJECT")
+    [ -d "$ACTIVATIONS_DIR" ] || exit 1
+    [ -n "$ACTIVATIONS_DIR" ] || exit 2
 
-    bad_dirs=$(find "$_FLOX_START_STATE_DIR" -type d ! -perm 700)
-    bad_files=$(find "$_FLOX_START_STATE_DIR" -type f ! -perm 600)
+    bad_dirs=$(find "$ACTIVATIONS_DIR" -type d ! -perm 700)
+    # Skip state.lock since we create that with fslock::LockFile
+    bad_files=$(find "$ACTIVATIONS_DIR" -type f ! -perm 600 ! -name state.lock)
 
     if [ -n "$bad_dirs" ]; then
       echo "ERROR: Directories with incorrect permissions (expected 700):" >&2

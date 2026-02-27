@@ -21,6 +21,7 @@ mod pull;
 mod push;
 mod search;
 mod services;
+mod services_socket;
 mod show;
 mod uninstall;
 mod upgrade;
@@ -64,14 +65,14 @@ use indoc::{formatdoc, indoc};
 use tempfile::TempDir;
 use thiserror::Error;
 use toml_edit::visit_mut::VisitMut;
-use toml_edit::{Item, Key, KeyMut, Value};
+use toml_edit::{Item, KeyMut, Value};
 use tracing::{debug, info};
 use url::Url;
 use xdg::BaseDirectories;
 
 use self::envs::DisplayEnvironments;
 use crate::commands::general::update_config;
-use crate::config::{Config, EnvironmentTrust, FLOX_CONFIG_FILE, FLOX_DIR_NAME};
+use crate::config::{Config, EnvironmentTrust, FLOX_DIR_NAME};
 use crate::utils::active_environments::{
     ActiveEnvironments,
     activated_environments,
@@ -79,17 +80,19 @@ use crate::utils::active_environments::{
 };
 use crate::utils::dialog::{Dialog, Select};
 use crate::utils::errors::display_chain;
-use crate::utils::init::{
-    init_catalog_client,
-    init_telemetry_uuid,
-    telemetry_opt_out_needs_migration,
-};
+use crate::utils::init::init_catalog_client;
 use crate::utils::message;
-use crate::utils::metrics::{AWSDatalakeConnection, Client, Hub, METRICS_UUID_FILE_NAME};
+use crate::utils::metrics::{AWSDatalakeConnection, Client, Hub};
 use crate::utils::update_notifications::UpdateNotification;
 
 const SHELL_COMPLETION_DIR: ShellComp = ShellComp::Dir { mask: None };
 const SHELL_COMPLETION_FILE: ShellComp = ShellComp::File { mask: None };
+const SHELL_COMPLETION_COMMAND: ShellComp = ShellComp::Raw {
+    bash: r#"COMPREPLY=($(compgen -A command -- "${COMP_WORDS[$COMP_CWORD]}"))"#,
+    zsh: "_command_names",
+    fish: "",
+    elvish: "",
+};
 
 static FLOX_DESCRIPTION: &'_ str = indoc! {"
     Flox is a virtual environment and package manager all in one.\n\n
@@ -182,7 +185,7 @@ impl fmt::Debug for Commands {
 
 impl FloxArgs {
     /// Initialize the command line by creating an initial FloxBuilder
-    pub async fn handle(self, mut config: crate::config::Config) -> Result<()> {
+    pub async fn handle(self, config: crate::config::Config) -> Result<()> {
         // ensure xdg dirs exist
         tokio::fs::create_dir_all(&config.flox.config_dir).await?;
         tokio::fs::create_dir_all(&config.flox.data_dir).await?;
@@ -230,30 +233,8 @@ impl FloxArgs {
             })
         };
 
-        // migrate metrics denial
-        // metrics could be turned off by writing an empty UUID file
-        // this branch migrates empty files to a config value in the user's flox.toml
-        // and deletes the now defunct empty file
-        if telemetry_opt_out_needs_migration(&config.flox.data_dir, &config.flox.cache_dir).await? {
-            info!("Migrating previous telemetry opt out to user config");
-            // update current run time config
-            config.flox.disable_metrics = true;
-
-            // update persistent config file
-            Config::write_to_in(
-                config.flox.config_dir.join(FLOX_CONFIG_FILE),
-                &[Key::new("disable_metrics")],
-                Some(true),
-            )?;
-
-            // remove marker uuid file
-            tokio::fs::remove_file(&config.flox.data_dir.join(METRICS_UUID_FILE_NAME)).await?;
-        }
-
         if !config.flox.disable_metrics {
             debug!("Metrics collection enabled");
-
-            init_telemetry_uuid(&config.flox.data_dir, &config.flox.cache_dir)?;
 
             let connection = AWSDatalakeConnection::default();
             let client = Client::new_with_config(&config, connection)?;
@@ -798,6 +779,12 @@ enum InternalCommands {
     ActivationState(
         #[bpaf(external(activation_state::activation_state))] activation_state::ActivationState,
     ),
+
+    /// Print the services socket path for an environment.
+    #[bpaf(command, long("services-socket"), hide)]
+    ServicesSocket(
+        #[bpaf(external(services_socket::services_socket))] services_socket::ServicesSocket,
+    ),
 }
 
 impl InternalCommands {
@@ -809,6 +796,7 @@ impl InternalCommands {
             InternalCommands::CheckForUpgrades(args) => args.handle(flox).await?,
             InternalCommands::Exit(args) => args.handle(flox)?,
             InternalCommands::ActivationState(args) => args.handle(flox)?,
+            InternalCommands::ServicesSocket(args) => args.handle(flox)?,
         }
         Ok(())
     }
@@ -903,6 +891,8 @@ pub enum EnvironmentSelectError {
     EnvironmentError(#[from] EnvironmentError),
     #[error("Did not find an environment in the current directory.")]
     EnvNotFoundInCurrentDirectory,
+    #[error("Did not find an active environment or an environment in the current directory.")]
+    EnvNotFound,
     #[error("Remote environments not supported for this operation")]
     RemoteNotSupported,
     #[error(transparent)]
@@ -977,8 +967,12 @@ impl EnvironmentSelect {
         let env = match self {
             EnvironmentSelect::Dir(path) => DirEnvironmentSelect::Dir(path.clone())
                 .detect_concrete_environment(flox, message)?,
-            EnvironmentSelect::Unspecified => {
-                DirEnvironmentSelect::Unspecified.detect_concrete_environment(flox, message)?
+            EnvironmentSelect::Unspecified => match detect_environment(message)? {
+                Some(env) => {
+                    let generation = activated_environments().is_active_with_generation(&env);
+                    env.into_concrete_environment(flox, generation)?
+                },
+                None => Err(EnvironmentSelectError::EnvNotFound)?,
             },
             EnvironmentSelect::Remote(env_ref) => {
                 let pointer = ManagedPointer::new(

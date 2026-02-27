@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -5,6 +6,7 @@ use anyhow::Result;
 use shell_gen::{GenerateShell, Shell, set_exported_unexpanded, unset};
 
 use crate::env_diff::EnvDiff;
+use crate::gen_rc::RM;
 
 /// Arguments for generating fish startup commands
 #[derive(Debug, Clone)]
@@ -142,7 +144,9 @@ pub fn generate_fish_startup_commands(
     }
 
     if let Some(path) = args.clean_up.as_ref() {
-        stmts.push(format!("rm '{}';", path.display()).to_stmt());
+        let path_str = path.to_string_lossy();
+        let escaped_path = shell_escape::escape(Cow::Borrowed(path_str.as_ref()));
+        stmts.push(format!("{RM} {};", escaped_path).to_stmt());
     }
 
     for stmt in stmts {
@@ -167,6 +171,7 @@ mod tests {
     fn test_generate_zsh_startup_commands_basic() {
         let additions = {
             let mut map = HashMap::new();
+            map.insert("QUOTED_VAR".to_string(), "QUOTED'VALUE".to_string());
             map.insert("ADDED_VAR".to_string(), "ADDED_VALUE".to_string());
             map
         };
@@ -188,17 +193,24 @@ mod tests {
         let mut buf = Vec::new();
         generate_fish_startup_commands(&args, &env_diff, &mut buf).unwrap();
         let output = String::from_utf8_lossy(&buf);
+        let (main_output, last_line) = output
+            .strip_suffix('\n')
+            .unwrap()
+            .rsplit_once('\n')
+            .unwrap();
+        assert_eq!(last_line, format!("{RM} /path/to/rc/file;"));
         expect![[r#"
-            set -gx fish_trace '1';
-            set -gx ADDED_VAR 'ADDED_VALUE';
+            set -gx fish_trace 1;
+            set -gx ADDED_VAR ADDED_VALUE;
+            set -gx QUOTED_VAR 'QUOTED'\''VALUE';
             set -e DELETED_VAR;
-            set -gx FLOX_ENV '/flox_env';
-            set -gx FLOX_ENV_CACHE '/flox_env_cache';
-            set -gx FLOX_ENV_PROJECT '/flox_env_project';
-            set -gx FLOX_ENV_DESCRIPTION 'env_description';
-            set -gx _activate_d '/activate_d';
-            set -gx _flox_activations '/flox_activations';
-            set -gx _flox_activate_tracer 'TRACER';
+            set -gx FLOX_ENV /flox_env;
+            set -gx FLOX_ENV_CACHE /flox_env_cache;
+            set -gx FLOX_ENV_PROJECT /flox_env_project;
+            set -gx FLOX_ENV_DESCRIPTION env_description;
+            set -gx _activate_d /activate_d;
+            set -gx _flox_activations /flox_activations;
+            set -gx _flox_activate_tracer TRACER;
             if isatty 1; source '/activate_d/set-prompt.fish'; end;
             set -gx FLOX_ENV_DIRS (if set -q FLOX_ENV_DIRS; echo "$FLOX_ENV_DIRS"; else; echo empty; end);
             /flox_activations set-env-dirs --shell fish --flox-env "/flox_env" --env-dirs "$FLOX_ENV_DIRS" | source;
@@ -206,8 +218,6 @@ mod tests {
             /flox_activations fix-paths --shell fish --env-dirs "$FLOX_ENV_DIRS" --path "$PATH" --manpath "$MANPATH" | source;
             set -g  _FLOX_SOURCED_PROFILE_SCRIPTS (if set -q _FLOX_SOURCED_PROFILE_SCRIPTS; echo "$_FLOX_SOURCED_PROFILE_SCRIPTS"; else; echo ""; end);
             /flox_activations profile-scripts --shell fish --already-sourced-env-dirs  "$_FLOX_SOURCED_PROFILE_SCRIPTS" --env-dirs "$FLOX_ENV_DIRS" | source;
-            set -gx fish_trace 0;
-            rm '/path/to/rc/file';
-        "#]].assert_eq(&output);
+            set -gx fish_trace 0;"#]].assert_eq(main_output);
     }
 }

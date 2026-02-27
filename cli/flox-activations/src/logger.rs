@@ -75,14 +75,14 @@ pub fn init_stderr_logger(verbosity_arg: Option<u32>) -> Result<u32, anyhow::Err
     Ok(subsystem_verbosity)
 }
 
-/// Replace existing logging with a file. Used by long-living child processes.
-pub fn init_file_logger(
-    verbosity_arg: Option<u32>,
+/// Initialize logging for the executive process.
+/// Sets up file logging and the Sentry tracing layer.
+pub fn init_executive_logger(
+    verbosity: u32,
     log_file: impl AsRef<str>,
     log_dir: impl AsRef<Path>,
-) -> Result<u32, anyhow::Error> {
-    let (subsystem_verbosity, filter) = Verbosity::verbosity_from_env_and_arg(verbosity_arg);
-    let env_filter = EnvFilter::try_new(filter)?;
+) -> Result<(), anyhow::Error> {
+    let env_filter = EnvFilter::try_new(Verbosity::from(verbosity).env_filter())?;
 
     let file_appender = tracing_appender::rolling::daily(log_dir, log_file.as_ref());
 
@@ -92,10 +92,15 @@ pub fn init_file_logger(
         .with_target(true)
         .boxed();
 
+    // The sentry layer is safe to add unconditionally - it checks for an active
+    // Sentry client at span capture time and is a no-op when none exists.
+    let sentry_layer = sentry::integrations::tracing::layer().enable_span_attributes();
+
     tracing_subscriber::registry()
         .with(file_layer)
         .with(env_filter)
+        .with(sentry_layer)
         .init();
 
-    Ok(subsystem_verbosity)
+    Ok(())
 }

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -5,6 +6,7 @@ use anyhow::Result;
 use shell_gen::{GenerateShell, Shell, set_unexported_unexpanded, source_file};
 
 use crate::env_diff::EnvDiff;
+use crate::gen_rc::RM;
 
 /// Arguments for generating zsh startup commands
 #[derive(Debug, Clone)]
@@ -61,7 +63,9 @@ pub fn generate_zsh_startup_commands(
     stmts.push(source_file(args.activate_d.join("zsh")));
 
     if let Some(path) = args.clean_up.as_ref() {
-        stmts.push(format!("rm '{}';", path.display()).to_stmt());
+        let path_str = path.to_string_lossy();
+        let escaped_path = shell_escape::escape(Cow::Borrowed(path_str.as_ref()));
+        stmts.push(format!("{RM} {};", escaped_path).to_stmt());
     }
 
     // N.B. the output of these scripts may be eval'd with backticks which have
@@ -89,6 +93,7 @@ mod tests {
     fn test_generate_zsh_startup_commands_basic() {
         let additions = {
             let mut map = HashMap::new();
+            map.insert("QUOTED_VAR".to_string(), "QUOTED'VALUE".to_string());
             map.insert("ADDED_VAR".to_string(), "ADDED_VALUE".to_string());
             map
         };
@@ -106,18 +111,23 @@ mod tests {
         let mut buf = Vec::new();
         generate_zsh_startup_commands(&args, &env_diff, &mut buf).unwrap();
         let output = String::from_utf8_lossy(&buf);
+        let (main_output, last_line) = output
+            .strip_suffix('\n')
+            .unwrap()
+            .rsplit_once('\n')
+            .unwrap();
+        assert_eq!(last_line, format!("{RM} /path/to/rc/file;"));
         expect![[r#"
-            typeset -g _flox_activate_tracelevel='3';
-            typeset -g _activate_d='/activate_d';
-            export ADDED_VAR='ADDED_VALUE';
+            typeset -g _flox_activate_tracelevel=3;
+            typeset -g _activate_d=/activate_d;
+            export ADDED_VAR=ADDED_VALUE;
+            export QUOTED_VAR='QUOTED'\''VALUE';
             unset DELETED_VAR;
-            typeset -g _FLOX_ENV='/flox_env';
-            typeset -g _FLOX_ENV_CACHE='/flox_env_cache';
-            typeset -g _FLOX_ENV_PROJECT='/flox_env_project';
-            typeset -g _FLOX_ENV_DESCRIPTION='env_description';
-            source '/activate_d/zsh';
-            rm '/path/to/rc/file';
-        "#]]
-        .assert_eq(&output);
+            typeset -g _FLOX_ENV=/flox_env;
+            typeset -g _FLOX_ENV_CACHE=/flox_env_cache;
+            typeset -g _FLOX_ENV_PROJECT=/flox_env_project;
+            typeset -g _FLOX_ENV_DESCRIPTION=env_description;
+            source /activate_d/zsh;"#]]
+        .assert_eq(main_output);
     }
 }

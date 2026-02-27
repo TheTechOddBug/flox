@@ -10,11 +10,13 @@
 #
 # ---------------------------------------------------------------------------- #
 
+set positional-arguments
+
 nix_options := "--extra-experimental-features nix-command \
                 --extra-experimental-features flakes"
 INPUT_DATA := "${PWD}/test_data/input_data"
 TEST_DATA := "${PWD}/test_data"
-cargo_test_invocation := "cargo nextest --profile ci run --manifest-path ${PWD}/cli/Cargo.toml --workspace"
+cargo_test_invocation := "cargo nextest --profile ci run --workspace"
 
 # Set the FLOX_VERSION variable so that it can be used in the build/runtime
 # It's important to add the git revision to the version string,
@@ -92,12 +94,12 @@ version:
 
 # Build the flox activations binary
 @build-activations:
-    pushd cli; cargo build -p flox-activations
+    cargo build -p flox-activations
 
 
 # Build the flox activations binary
 @build-activations-release:
-    pushd cli; cargo build -p flox-activations -r
+    cargo build -p flox-activations -r
 
 
 
@@ -105,14 +107,14 @@ version:
 # Build the flox binary
 
 @build-cli: build-nix-plugins build-package-builder build-activation-scripts build-buildenv
-    pushd cli; cargo build -p flox
+    cargo build -p flox
 
 # Build the binaries
 @build: build-cli
 
 # Build flox with release profile
 @build-release: build-nix-plugins build-package-builder build-activation-scripts build-buildenv
-    pushd cli; cargo build -p flox -r
+    cargo build -p flox -r
 
 # Remove build artifacts
 @clean-builds:
@@ -122,7 +124,7 @@ version:
 # Build just the data generator
 
 @build-data-gen:
-    pushd cli; cargo build -p mk_data; popd
+    cargo build -p mk_data
 
 # Generate test data
 @gen-data floxhub_path +mk_data_args="": (mk-data mk_data_args)
@@ -142,7 +144,7 @@ version:
 
 # The same as mk-data, but faster to type, and doesn't rebuild stuff
 @md +mk_data_args="":
-    mkdata="$PWD/cli/target/debug/mk_data"; pushd test_data; "$mkdata" {{mk_data_args}} config.toml; popd
+    mkdata="$PWD/target/debug/mk_data"; pushd test_data; "$mkdata" {{mk_data_args}} config.toml; popd
 
 gen-unit-data-no-publish force="":
     #!/usr/bin/env bash
@@ -158,6 +160,20 @@ gen-unit-data-no-publish force="":
     # Use remote services for non-publish tests
     {{cargo_test_invocation}} --filterset 'not (test(providers::build::tests) | test(providers::publish) | test(commands::publish) | test(providers::catalog::tests::creates_new_catalog))'
 
+    # Extract latest package versions from production catalog for test assertions.
+    # These versions must match what's in the recorded mock YAML files.
+    echo "Extracting latest package versions from production catalog..."
+    python_version=$(curl -s 'https://api.flox.dev/api/v1/catalog/packages/python3' | jq -r '.items[0].version')
+    go_version=$(curl -s 'https://api.flox.dev/api/v1/catalog/packages/go' | jq -r '.items[0].version')
+    poetry_version=$(curl -s 'https://api.flox.dev/api/v1/catalog/packages/poetry' | jq -r '.items[0].version')
+    jq -n \
+        --arg python3 "$python_version" \
+        --arg go "$go_version" \
+        --arg poetry "$poetry_version" \
+        '{python3: $python3, go: $go, poetry: $poetry}' \
+        > "{{TEST_DATA}}/unit_test_generated/latest_prod_versions.json"
+    echo "Wrote latest_prod_versions.json with python3=$python_version, go=$go_version, poetry=$poetry_version"
+
 gen-unit-data-for-publish floxhub_repo_path force="":
     #!/usr/bin/env bash
 
@@ -167,8 +183,11 @@ gen-unit-data-for-publish floxhub_repo_path force="":
 
     set -euo pipefail
 
+    # Get the catalog server URL from the FloxHub environment
+    catalog_server_url="$(flox activate -d "{{floxhub_repo_path}}" -- bash -c 'echo $FLOXHUB_CATALOG_SERVER_URL')"
+
     # Get the latest Nixpkgs revision that exists in the catalog
-    nixpkgs_rev="$(curl -X 'GET' --silent 'http://localhost:8000/api/v1/catalog/info/base-catalog' -H 'accept: application/json' | jq .scraped_pages[0].rev | tr -d "'\"")"
+    nixpkgs_rev="$(curl -X 'GET' --silent "${catalog_server_url}/api/v1/catalog/info/base-catalog" -H 'accept: application/json' | jq .scraped_pages[0].rev | tr -d "'\"")"
     if [ -z "$nixpkgs_rev" ]; then
         echo "failed to communicate with floxhub services"
         exit 1
@@ -203,7 +222,7 @@ gen-unit-data-for-publish floxhub_repo_path force="":
 
 # Generate JSON schemas for Flox data structures
 @gen-schemas:
-  pushd cli; cargo xtask generate-schemas
+  cargo xtask generate-schemas
 
 # ---------------------------------------------------------------------------- #
 
@@ -214,8 +233,7 @@ gen-unit-data-for-publish floxhub_repo_path force="":
 # Run the CLI integration test suite using locally built binaries
 # This is equivalent to the "local" jobs in CI.
 @integ-tests +bats_args="": build
-    flox-cli-tests \
-        {{bats_args}}
+    flox-cli-tests "$@"
 
 # Run the CLI integration test suite using Nix-built binaries
 # This is equivalent to the "remote" jobs in CI.
@@ -223,8 +241,7 @@ gen-unit-data-for-publish floxhub_repo_path force="":
     nix run \
         --accept-flake-config \
         --extra-experimental-features 'nix-command flakes' \
-        .#flox-cli-tests \
-        {{bats_args}}
+        .#flox-cli-tests -- "$@"
 
 @ut regex="" record="false":
     _FLOX_UNIT_TEST_RECORD={{record}} {{cargo_test_invocation}} {{regex}}
@@ -232,8 +249,30 @@ gen-unit-data-for-publish floxhub_repo_path force="":
 # Run the CLI unit tests
 @unit-tests regex="" record="false": build (ut regex record)
 
+build-nef-test-fixtures:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --package nef-lock-catalog 1>&2
+    lock_bin="$PWD/target/debug/lock"
+    testdata="$PWD/package-builder/nef/tests/instantiateTests/testData"
+    tmpdir=$(realpath "$(mktemp -d "${TMPDIR:-/tmp}/nef-test-fixtures.XXXXXX")")
+    cp -r "$testdata"/* "$tmpdir/"
+    # Lock deepest configs first so child locks exist before parents reference them
+    find "$tmpdir" -name nix-builds.toml -print0 \
+        | sort -zr \
+        | while IFS= read -r -d '' config; do
+            dir=$(dirname "$config")
+            (cd "$dir" && "$lock_bin" --pkgs-dir pkgs --catalogs-lock nix-builds.lock nix-builds.toml)
+          done
+    echo "$tmpdir"
+
 test-nef:
-    nix-unit package-builder/nef/tests --arg nixpkgs-url "$COMMON_NIXPKGS_URL"
+    #!/usr/bin/env bash
+    set -euo pipefail
+    fixtures="$(just build-nef-test-fixtures)"
+    nix-unit package-builder/nef/tests \
+        --arg nixpkgs-url "$COMMON_NIXPKGS_URL" \
+        --argstr test-fixtures "$fixtures"
 
 test-buildenvLib:
     nix-unit buildenv/buildenvLib/tests
@@ -279,7 +318,6 @@ test-all: test-nix-plugins impure-tests integ-tests nix-integ-tests
 
 # Output licenses of all dependency crates
 @license:
-    pushd cli;                                     \
      cargo metadata --format-version 1              \
        |jq -r '.packages[]|[.name,.license]|@csv';
 
@@ -288,24 +326,24 @@ test-all: test-nix-plugins impure-tests integ-tests nix-integ-tests
 
 # Run a `flox` command
 @flox +args="": build
-    cli/target/debug/flox {{args}}
+    target/debug/flox {{args}}
 
 # Run a `flox` command using the catalog
 @catalog-flox +args="": build
     echo "just: DEPRECATED TARGET: Use 'flox' instead" >&2;
-    cli/target/debug/flox {{args}}
+    target/debug/flox {{args}}
 
 
 # ---------------------------------------------------------------------------- #
 
 # Clean ( remove ) built artifacts
 @clean: clean-nix-plugins
-    pushd cli; cargo clean; popd
+    cargo clean
 
 # ---------------------------------------------------------------------------- #
 
 @format-cli:
-    pushd cli; cargo fmt; popd
+    cargo fmt
 
 @format-nix-plugins:
     clang-format -i nix-plugins/src/**/*.cc; \

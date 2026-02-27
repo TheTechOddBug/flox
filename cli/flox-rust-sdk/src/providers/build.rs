@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::LazyLock;
 
-use flox_core::activate::vars::FLOX_RUNTIME_DIR_VAR;
 use indoc::formatdoc;
 use itertools::Itertools;
 use serde::Deserialize;
@@ -198,7 +197,6 @@ pub struct FloxBuildMk<'args> {
     verbosity: i32,
     // should these be borrows?
     temp_dir: &'args Path,
-    runtime_dir: &'args Path,
 
     // common build components
     base_dir: &'args Path,
@@ -222,7 +220,6 @@ impl FloxBuildMk<'_> {
         FloxBuildMk {
             verbosity: flox.verbosity,
             temp_dir: &flox.temp_dir,
-            runtime_dir: &flox.runtime_dir,
             base_dir,
             expression_dir,
             built_environments,
@@ -246,7 +243,6 @@ impl FloxBuildMk<'_> {
         FloxBuildMk {
             verbosity: flox.verbosity,
             temp_dir: &flox.temp_dir,
-            runtime_dir: &flox.runtime_dir,
             base_dir,
             expression_dir,
             built_environments,
@@ -350,11 +346,6 @@ impl ManifestBuilder for FloxBuildMk<'_> {
         if !build_cache {
             command.arg("DISABLE_BUILDCACHE=true");
         }
-
-        // activate needs this var
-        // TODO: we should probably figure out a more consistent way to pass
-        // this since it's also passed for `flox activate`
-        command.env(FLOX_RUNTIME_DIR_VAR, self.runtime_dir);
 
         if self.stdout_buffer.is_some() {
             command.stdout(Stdio::piped());
@@ -562,6 +553,14 @@ pub fn find_toplevel_group_nixpkgs(lockfile: &Lockfile) -> Option<BaseCatalogUrl
 fn get_nix_expression_targets(
     expression_dir: &Path,
 ) -> Result<Vec<(String, ExpressionBuildMetadata)>, ManifestBuilderError> {
+    if !expression_dir.exists() {
+        debug!(
+            path = %expression_dir.display(),
+            "expression directory does not exist, skipping nix expression target discovery"
+        );
+        return Ok(vec![]);
+    }
+
     #[derive(Debug, Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct NefTargetReflect {
@@ -573,7 +572,12 @@ fn get_nix_expression_targets(
     let output = nix_base_command()
         .arg("eval")
         .args(["--argstr", "nixpkgs-url", COMMON_NIXPKGS_URL.as_str()])
-        .args(["--argstr", "pkgs-dir", &*expression_dir.to_string_lossy()])
+        .args([
+            "--argstr",
+            "source-ref",
+            &format!("path:{}", &*expression_dir.to_string_lossy()),
+        ])
+        .args(["--argstr", "pkgs-dir", "."])
         .args([
             "--file",
             &*FLOX_EXPRESSION_BUILD_NIX.to_string_lossy(),
@@ -2406,17 +2410,12 @@ mod tests {
         }
 
         let store_path_prefix_pattern = r"/nix/store/[\w]{32}";
-        let expected_pattern = if cfg!(target_os = "macos") {
-            formatdoc! {r#"
-                2 packages found in {store_path_prefix_pattern}-{package_name}-0\.0\.0
-                       not found in {store_path_prefix_pattern}-environment-build-{package_name}
-        "#}
-        } else {
-            formatdoc! {r#"
-                1 packages found in {store_path_prefix_pattern}-{package_name}-0\.0\.0
-                       not found in {store_path_prefix_pattern}-environment-build-{package_name}
-        "#}
-        };
+        // Use \d+ to match any positive number of packages - the exact count
+        // depends on the nixpkgs version and transitive dependencies.
+        let expected_pattern = formatdoc! {r#"
+            \d+ packages found in {store_path_prefix_pattern}-{package_name}-0\.0\.0
+                   not found in {store_path_prefix_pattern}-environment-build-{package_name}
+        "#};
         let re = regex::Regex::new(&expected_pattern).unwrap();
         assert!(
             re.is_match(&output.stderr),

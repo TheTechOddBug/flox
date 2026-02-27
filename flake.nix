@@ -108,6 +108,18 @@
           flox-buildenv = callPackage ./pkgs/flox-buildenv { };
           flox-activations = callPackage ./pkgs/flox-activations { };
           flox-cli = callPackage ./pkgs/flox-cli { };
+
+          # Kerberos-enabled variant with GSSAPI authentication
+          flox-cli-kerberos = callPackage ./pkgs/flox-cli {
+            overrideCatalogAuth = "floxhub-authn-kerberos";
+            rust-internal-deps = final.rust-internal-deps.override {
+              overrideCatalogAuth = "floxhub-authn-kerberos";
+              rust-external-deps = final.rust-external-deps.override {
+                overrideCatalogAuth = "floxhub-authn-kerberos";
+              };
+            };
+          };
+
           flox-manpages = callPackage ./pkgs/flox-manpages { }; # Flox Command Line Interface Manpages
           flox = callPackage ./pkgs/flox { }; # Flox Command Line Interface ( production build ).
 
@@ -125,11 +137,13 @@
               prev.runCommandNoCC "flox-activations"
                 {
                   name = "flox-activations";
-                  path = floxActivationsBin;
+                  # Ensure OpenSSL is in the closure for the cargo-built binary
+                  # which links against it via sentry -> native-tls
+                  propagatedBuildInputs = prev.lib.optionals prev.stdenv.isLinux [ prev.openssl.out ];
                 }
                 ''
                   mkdir -p $out/libexec
-                  ln -s ${floxActivationsBin} $out/libexec/flox-activations
+                  cp ${floxActivationsBin} $out/libexec/flox-activations
                 '';
           in
           prev.lib.makeScope prev.newScope (self: {
@@ -191,6 +205,7 @@
           flox-package-builder
           flox-activations
           flox-cli
+          flox-cli-kerberos
           flox-cli-tests
           flox-manpages
           flox

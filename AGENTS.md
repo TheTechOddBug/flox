@@ -10,11 +10,36 @@ Flox is a virtual environment and package manager built on Nix. It creates porta
 
 ## Development Setup
 
+All tools (`just`, `cargo`, `rustc`, `bats`, etc.) are provided by the Nix dev
+shell. They are not available on bare PATH.
+
 ```bash
-nix develop                    # Enter dev shell with all dependencies
+nix develop                    # Enter interactive dev shell
 ```
 
+**For agents and non-interactive use**, wrap every command with `nix develop -c`:
+
+```bash
+nix develop -c just build
+nix develop -c just test-all
+nix develop -c cargo clippy --all
+```
+
+**This includes git operations** — `git push` and `git commit` trigger
+pre-commit/pre-push hooks that depend on tools (clippy, rustfmt, treefmt)
+provided by the dev shell:
+
+```bash
+nix develop -c git push origin my-branch
+```
+
+**This is required** — running `just`, `cargo`, `git push`, or other commands
+without the `nix develop` wrapper will fail with "command not found" errors.
+
 ## Common Commands
+
+All commands below assume you are inside `nix develop` or prefixed with
+`nix develop -c`.
 
 ```bash
 # Building
@@ -33,8 +58,10 @@ just unit-tests                # Unit tests
 just impure-tests              # Unit tests with extra-tests feature
 just integ-tests               # Integration tests (bats)
 just unit-tests regex="test_name"     # Run specific unit test
-just integ-tests usage.bats           # Run specific test file
-just integ-tests -- --filter-tags tag # Run tests by tag
+just integ-tests usage.bats                       # Run specific integration test file
+just integ-tests -- --filter-tags tag             # Run integration tests by tag
+just integ-tests -- --filter regex                # Run integration tests by name
+just integ-tests activate.bats -- --filter regex  # Run integration tests, filtering by both test file and test name. This is faster when wanting to run tests in a single file, because bats doesn't have to filter through all the tests in other files
 
 # Formatting and Linting
 just format                    # Format all code
@@ -74,14 +101,6 @@ pre-commit run -a              # Run all linters
 
 ## Testing
 
-### Integration Test Tags
-
-Tests use bats tags for filtering: `init`, `build_env`, `install`, `uninstall`, `activate`, `push`, `pull`, `search`, `edit`, `list`, `delete`, `upgrade`, `project_env`, `managed_env`, `remote_env`, `python`, `node`, `go`, etc.
-
-```bash
-just integ-tests -- --filter-tags activate  # Run activation tests
-```
-
 ### Mock Data Generation
 
 Mock catalog responses are generated against local floxhub services. See `CONTRIBUTING.md` for details on regenerating mocks.
@@ -99,8 +118,12 @@ FLOX_ACTIVATE_TRACE=1 result/bin/flox activate [args]
 
 - **Rust style:**
   - Follow existing style and Rust idioms
-  - Favor early returns from functions and functional programming style over nested conditionals-
+  - Use early returns from functions and functional programming style; don't use nested conditionals
   - Structs should derive `Clone` and `Debug`
+  - Use structured log and tracing fields; don't interpolate variables into single strings
+  - Use `assert_eq!` on entire structs in tests so that it's easier to debug failures and catch new fields; don't `assert!` or `assert_eq!` on individual fields
+  - Add `use` statements to modules; don't inline absolute paths and don't add to nearest function
+  - Always update `use` statements when moving code between modules; don't re-export existing names
 - **Commits:** Conventional commits format (`feat:`, `fix:`, `chore:`, etc.). Use `cz commit` for interactive commits
 - **Rust 2024 edition** for main crates
 
@@ -110,7 +133,7 @@ For rust-analyzer, add to `.vscode/settings.json`:
 
 ```json
 {
-  "rust-analyzer.linkedProjects": ["${workspaceFolder}/cli/Cargo.toml"],
+  "rust-analyzer.linkedProjects": ["${workspaceFolder}/Cargo.toml"],
   "rust-analyzer.cargo.features": ["extra-tests"]
 }
 ```

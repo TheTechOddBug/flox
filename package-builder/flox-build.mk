@@ -143,14 +143,27 @@ ifeq (,$(NIX_EXPRESSION_DIR))
   $(error NIX_EXPRESSION_DIR not defined)
 endif
 
-# If there is no git root,
+# Construct three orthogonal arguments for nef:
+#   source-ref: flakeref to the source root (for fetching/tracking)
+#   pkgs-dir:   relative path to packages directory within the source
+#   catalogs-lock: relative path to catalog lock file within the source (if present)
 ifeq (,$(NIX_EXPRESSION_GIT_ROOT))
   NIX_EXPRESSION_DIR_ARGS := \
-    --arg pkgs-dir '$(NIX_EXPRESSION_DIR)'
+    --argstr source-ref 'path:$(dir $(NIX_EXPRESSION_DIR))' \
+    --argstr pkgs-dir '$(notdir $(NIX_EXPRESSION_DIR))'
+  NIX_CATALOGS_LOCK_PATH := $(dir $(NIX_EXPRESSION_DIR))/nix-builds.lock
+  NIX_CATALOGS_LOCK_REL := nix-builds.lock
 else
   NIX_EXPRESSION_DIR_ARGS := \
-    --argstr pkgs-dir '$(NIX_EXPRESSION_GIT_ROOT)' \
-    --argstr git-subdir '$(NIX_EXPRESSION_GIT_SUBDIR)'
+    --argstr source-ref 'git+file://$(NIX_EXPRESSION_GIT_ROOT)' \
+    --argstr pkgs-dir '$(NIX_EXPRESSION_GIT_SUBDIR)'
+  NIX_CATALOGS_LOCK_PATH := $(NIX_EXPRESSION_GIT_ROOT)/$(NIX_EXPRESSION_GIT_SUBDIR)/../nix-builds.lock
+  NIX_CATALOGS_LOCK_REL := $(NIX_EXPRESSION_GIT_SUBDIR)/../nix-builds.lock
+endif
+
+# Add catalogs-lock only if the file exists
+ifneq (,$(wildcard $(NIX_CATALOGS_LOCK_PATH)))
+  NIX_EXPRESSION_DIR_ARGS += --argstr catalogs-lock '$(NIX_CATALOGS_LOCK_REL)'
 endif
 
 
@@ -237,8 +250,10 @@ define COMMON_BUILD_VARS_template =
   # Create a target for cleaning up the temporary directory.
   .PHONY: clean/$(_pname)
   clean/$(_pname):
-	-$(_V_) $(_find) $($(_pvarname)_tmpBasename) -type d -exec $(_chmod) +w {} \;
-	-$(_V_) $(_rm) -rf $($(_pvarname)_tmpBasename)
+	-$(_V_) if [ -d "$($(_pvarname)_tmpBasename)" ]; then \
+	  $(_find) $($(_pvarname)_tmpBasename) -type d -exec $(_chmod) +w {} \; && \
+	  $(_rm) -rf $($(_pvarname)_tmpBasename); \
+	fi
 
   clean_targets += clean/$(_pname)
 
@@ -362,7 +377,7 @@ endef
 # from the environment prior to kicking off a manifest build.
 # TODO: move the clearing of variables to "activate --mode build"
 FLOX_MANAGED_ENV_VARS = \
-  FLOX_ACTIVATE_TRACE FLOX_ENV_DIRS FLOX_RUNTIME_DIR \
+  FLOX_ACTIVATE_TRACE FLOX_ENV_DIRS \
   INFOPATH CPATH PKG_CONFIG_PATH ACLOCAL_PATH XDG_DATA_DIRS \
   LD_AUDIT GLIBC_TUNABLES DYLD_FALLBACK_LIBRARY_PATH \
   PYTHONPATH PIP_CONFIG_FILE RUST_SRC_PATH JUPYTER_PATH LD_FLOXLIB_FILES_PATH
@@ -422,8 +437,10 @@ define BUILD_local_template =
 	@# Actually perform the build using the temporary build wrapper.
 	@#
 	@echo "Building $(_name) in local mode"
-	-$(_VV_) $(_find) $($(_pvarname)_out) -type d -exec $(_chmod) +w {} \;
-	-$(_VV_) $(_rm) -rf $($(_pvarname)_out)
+	-$(_VV_) if [ -e "$($(_pvarname)_out)" ]; then \
+	  $(_find) $($(_pvarname)_out) -type d -exec $(_chmod) +w {} \; && \
+	  $(_rm) -rf $($(_pvarname)_out); \
+	fi
 	$(_V_) $(_env) $$(QUOTED_ENV_DISALLOW_ARGS) out=$($(_pvarname)_out) \
 	  $(if $(_virtualSandbox),$(PRELOAD_VARS) FLOX_SRC_DIR=$(PWD) FLOX_VIRTUAL_SANDBOX=$(_sandbox)) \
 	  $(FLOX_INTERPRETER)/activate --env $$($(_pvarname)_develop_copy_env) \
@@ -713,7 +730,7 @@ define JSON_VERSION_TO_COMMAND_jq =
       to_entries[] | \
       if .key == "file" then "$(_cat) \(.value)" else (
         if .key == "command" then (
-          "$(FLOX_ENV)/activate --mode build --skip-hook-on-activate -- \(.value)"
+          "$(FLOX_ENV)/activate --mode build --skip-hook-on-activate --env $(FLOX_ENV) -- \(.value)"
         ) else (
           "unknown version type: \(.key)" | halt_error(1)
         ) end

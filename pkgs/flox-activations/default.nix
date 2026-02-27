@@ -21,6 +21,7 @@ let
     FLOX_ACTIVATIONS_BIN = "${placeholder "out"}/libexec/flox-activations";
     # Nix will ignore this if it starts with just BASH
     X_BASH_BIN = "${bash}/bin/bash";
+    COREUTILS = "${coreutils}";
   };
 
 in
@@ -42,18 +43,17 @@ craneLib.buildPackage (
     # if we add shared (internal) packages.
     cargoExtraArgs = "--locked -p flox-activations";
 
-    CARGO_LOG = "cargo::core::compiler::fingerprint=info";
     CARGO_PROFILE = "small";
 
     # runtime dependencies
-    buildInputs = rust-external-deps.buildInputs ++ [ ];
+    buildInputs = rust-external-deps.buildInputs ++ [
+      coreutils # for `sleep infinity`
+    ];
 
     # build dependencies
     nativeBuildInputs = rust-external-deps.nativeBuildInputs;
 
-    propagatedBuildInputs = rust-external-deps.propagatedBuildInputs ++ [
-      coreutils # for `sleep infinity`
-    ];
+    propagatedBuildInputs = rust-external-deps.propagatedBuildInputs ++ [ ];
 
     # https://github.com/ipetkov/crane/issues/385
     # doNotLinkInheritedArtifacts = true;
@@ -89,12 +89,13 @@ craneLib.buildPackage (
       devShellHook = ''
         #  # Find the project root and add the `bin' directory to `PATH'.
         if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-          PATH="$( git rev-parse --show-toplevel; )/cli/target/debug":$PATH;
+          PATH="$( git rev-parse --show-toplevel; )/target/debug":$PATH;
           REPO_ROOT="$( git rev-parse --show-toplevel; )";
         fi
       '';
     };
   }
+  // rust-external-deps.passthru.envs
   // envs
   // lib.optionalAttrs stdenv.hostPlatform.isLinux {
     LOCALE_ARCHIVE = "${glibcLocalesUtf8}/lib/locale/locale-archive";

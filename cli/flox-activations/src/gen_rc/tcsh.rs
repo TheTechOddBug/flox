@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -5,6 +6,7 @@ use anyhow::Result;
 use shell_gen::{GenerateShell, Shell, set_exported_unexpanded, unset};
 
 use crate::env_diff::EnvDiff;
+use crate::gen_rc::RM;
 
 /// Arguments for generating tcsh startup commands
 #[derive(Debug, Clone)]
@@ -144,7 +146,9 @@ pub fn generate_tcsh_startup_commands(
     }
 
     if let Some(path) = args.clean_up.as_ref() {
-        stmts.push(format!("rm '{}';", path.display()).to_stmt());
+        let path_str = path.to_string_lossy();
+        let escaped_path = shell_escape::escape(Cow::Borrowed(path_str.as_ref()));
+        stmts.push(format!("{RM} {};", escaped_path).to_stmt());
     }
 
     for stmt in stmts {
@@ -169,6 +173,7 @@ mod tests {
     fn test_generate_tcsh_startup_commands_basic() {
         let additions = {
             let mut map = HashMap::new();
+            map.insert("QUOTED_VAR".to_string(), "QUOTED'VALUE".to_string());
             map.insert("ADDED_VAR".to_string(), "ADDED_VALUE".to_string());
             map
         };
@@ -190,17 +195,24 @@ mod tests {
         let mut buf = Vec::new();
         generate_tcsh_startup_commands(&args, &env_diff, &mut buf).unwrap();
         let output = String::from_utf8_lossy(&buf);
+        let (main_output, last_line) = output
+            .strip_suffix('\n')
+            .unwrap()
+            .rsplit_once('\n')
+            .unwrap();
+        assert_eq!(last_line, format!("{RM} /path/to/rc/file;"));
         expect![[r#"
             set verbose
-            setenv ADDED_VAR 'ADDED_VALUE';
+            setenv ADDED_VAR ADDED_VALUE;
+            setenv QUOTED_VAR 'QUOTED'\''VALUE';
             unsetenv DELETED_VAR;
-            setenv FLOX_ENV '/flox_env';
-            setenv FLOX_ENV_CACHE '/flox_env_cache';
-            setenv FLOX_ENV_PROJECT '/flox_env_project';
-            setenv FLOX_ENV_DESCRIPTION 'env_description';
-            setenv _activate_d '/activate_d';
-            setenv _flox_activations '/flox_activations';
-            setenv _flox_activate_tracer 'TRACER';
+            setenv FLOX_ENV /flox_env;
+            setenv FLOX_ENV_CACHE /flox_env_cache;
+            setenv FLOX_ENV_PROJECT /flox_env_project;
+            setenv FLOX_ENV_DESCRIPTION env_description;
+            setenv _activate_d /activate_d;
+            setenv _flox_activations /flox_activations;
+            setenv _flox_activate_tracer TRACER;
             if ( $?tty ) then; source '/activate_d/set-prompt.tcsh'; endif;
             if (! $?FLOX_ENV_DIRS) setenv FLOX_ENV_DIRS "empty";
             eval "`'/flox_activations' set-env-dirs --shell tcsh --flox-env '/flox_env' --env-dirs $FLOX_ENV_DIRS:q`";
@@ -210,8 +222,6 @@ mod tests {
             if ($?_FLOX_SOURCED_PROFILE_SCRIPTS) set _already_sourced_args = ( --already-sourced-env-dirs `echo $_FLOX_SOURCED_PROFILE_SCRIPTS:q` );
             eval "`'/flox_activations' profile-scripts --shell tcsh --env-dirs $FLOX_ENV_DIRS:q $_already_sourced_args:q`";
             unhash;
-            unset verbose;
-            rm '/path/to/rc/file';
-        "#]].assert_eq(&output);
+            unset verbose;"#]].assert_eq(main_output);
     }
 }

@@ -6,15 +6,16 @@ use std::process::ExitCode;
 use anyhow::Result;
 use bpaf::{Args, Parser};
 use commands::{EnvironmentSelectError, FloxArgs, FloxCli, Prefix, Version};
+use flox_core::sentry::init_sentry;
 use flox_core::vars::{FLOX_VERSION_STRING, FLOX_VERSION_VAR};
 use flox_rust_sdk::flox::FLOX_VERSION;
 use flox_rust_sdk::models::environment::EnvironmentError;
 use flox_rust_sdk::models::environment::managed_environment::ManagedEnvironmentError;
 use flox_rust_sdk::models::environment::remote_environment::RemoteEnvironmentError;
 use flox_rust_sdk::providers::services::process_compose::ServiceError;
-use tracing::debug;
+use tracing::{debug, warn};
 use utils::errors::format_service_error;
-use utils::init::{init_logger, init_sentry};
+use utils::init::init_logger;
 use utils::{message, populate_default_nix_env_vars};
 
 use crate::utils::errors::{
@@ -23,25 +24,16 @@ use crate::utils::errors::{
     format_managed_error,
     format_remote_error,
 };
-use crate::utils::metrics::Hub;
+use crate::utils::init::init_telemetry_uuid;
+use crate::utils::metrics::{Hub, read_metrics_uuid};
 
 mod commands;
 mod config;
 mod utils;
 
 async fn run(args: FloxArgs) -> Result<()> {
-    set_parent_process_id();
     populate_default_nix_env_vars();
     let config = config::Config::parse()?;
-    let uuid = utils::metrics::read_metrics_uuid(&config)
-        .map(|u| Some(u.to_string()))
-        .unwrap_or(None);
-    sentry::configure_scope(|scope| {
-        scope.set_user(Some(sentry::User {
-            id: uuid,
-            ..Default::default()
-        }));
-    });
     args.handle(config).await?;
     Ok(())
 }
@@ -57,6 +49,20 @@ fn main() -> ExitCode {
     // because at this point the program is still single threaded.
     unsafe {
         env::remove_var(FLOX_VERSION_VAR);
+    }
+
+    // Override bpaf's bash completion script to fix unsafe eval.
+    // bpaf's generated script interpolates COMP_WORDS into a string
+    // and passes it to `eval`, so unclosed quotes in user input
+    // (e.g. `flox activate -c "bas<TAB>`) cause parse errors.
+    // Our version uses array-based argument passing instead.
+    // Upstream issue: https://github.com/pacak/bpaf/issues/440
+    // This must run before any bpaf parser call (Prefix::check, etc.)
+    // because bpaf's ArgScanner intercepts this flag and calls
+    // process::exit(0) directly.
+    if env::args_os().any(|a| a == "--bpaf-complete-style-bash") {
+        print!("{}", BASH_COMPLETION_SCRIPT);
+        return ExitCode::from(0);
     }
 
     // Quit early if `--prefix` is present
@@ -91,14 +97,19 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
-    let disable_metrics = config::Config::parse()
-        .unwrap_or_default()
-        .flox
-        .disable_metrics;
+    let config = config::Config::parse().unwrap_or_default();
+    let metrics_uuid = if !config.flox.disable_metrics {
+        init_telemetry_uuid(&config.flox.data_dir, &config.flox.cache_dir)
+            .and_then(|_| read_metrics_uuid(&config))
+            .inspect_err(|e| warn!("Failed to initialize metrics UUID: {e}"))
+            .ok()
+    } else {
+        None
+    };
 
     // Sentry client must be initialized before starting an async runtime or spawning threads
     // https://docs.sentry.io/platforms/rust/#async-main-function
-    let _sentry_guard = (!disable_metrics).then(init_sentry);
+    let _sentry_guard = metrics_uuid.map(|uuid| init_sentry("flox-cli", uuid));
     let _metrics_guard = Hub::global().try_guard().ok();
 
     // Pass down the verbosity level to all sub-processes
@@ -203,6 +214,28 @@ fn main() -> ExitCode {
     // drop(runtime) should implicitly be last
 }
 
+/// Fixed bash completion script that replaces bpaf's generated version.
+///
+/// Workaround for <https://github.com/pacak/bpaf/issues/440>.
+///
+/// bpaf's script does:
+///   line="$1 --bpaf-complete-rev=8 ${COMP_WORDS[@]:1}"
+///   source <( eval ${line})
+///
+/// The unquoted ${COMP_WORDS[@]:1} interpolation means special characters
+/// in user input (unclosed quotes, backticks, etc.) are interpreted by eval.
+///
+/// Our version passes each COMP_WORD as a separate array element, avoiding
+/// eval entirely. This correctly preserves word boundaries and handles all
+/// special characters.
+const BASH_COMPLETION_SCRIPT: &str = r#"_bpaf_dynamic_completion()
+{
+    local -a _args=("$1" "--bpaf-complete-rev=8" "${COMP_WORDS[@]:1}")
+    source <( "${_args[@]}" )
+}
+complete -o nosort -F _bpaf_dynamic_completion flox
+"#;
+
 /// Error to exit without printing an error message
 #[derive(Debug)]
 struct Exit(ExitCode);
@@ -243,18 +276,6 @@ fn set_user() -> Result<()> {
             debug!(euid = %effective_uid, user = %user_var, "Unable to get passwd entry for USER and HOME check");
         };
         Ok(())
-    }
-}
-
-/// Stores the PID of the executing shell as shells do not set $SHELL
-/// when they are launched.
-///
-/// $FLOX_PARENT_PID is used when launching sub-shells to ensure users
-/// keep running their chosen shell.
-fn set_parent_process_id() {
-    let ppid = nix::unistd::getppid();
-    unsafe {
-        env::set_var("FLOX_PARENT_PID", ppid.to_string());
     }
 }
 
